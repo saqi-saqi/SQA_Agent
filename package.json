@@ -1,0 +1,25 @@
+{
+  "name": "sqa-agent",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Software QA agent — explores, plans, and runs comprehensive web + API test suites",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
+    "start": "node server/index.js || node dashboard/server.js",
+    "start:dashboard": "node dashboard/server.js"
+  },
+  "dependencies": {
+    "@axe-core/playwright": "^4.10.0",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.0.0",
+    "playwright": "^1.45.0",
+    "z-ai-web-dev-sdk": "^0.0.18",
+    "zod": "^3.23.0"
+  }
+}

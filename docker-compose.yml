@@ -1,0 +1,12 @@
+# SQA Agent monitoring service — single VPS deployment
+# Usage: docker compose up -d
+
+services:
+  sqa-agent:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - ./data:/app/data   # run results + monitors.json persist here
+    restart: unless-stopped
