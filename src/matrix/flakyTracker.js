@@ -22,6 +22,7 @@
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { SqliteFlakyStore } from '../storage/flakyStore.js';
 
 const DEFAULT_HISTORY_FILE = 'flaky-history.json';
 
@@ -49,10 +50,19 @@ export function buildRunSummary(run) {
  *   }
  */
 export class FlakyTracker {
-  constructor({ dataDir = './data', historyFile = DEFAULT_HISTORY_FILE } = {}) {
+  constructor({ dataDir = './data', historyFile = DEFAULT_HISTORY_FILE, useSqlite, db } = {}) {
     this.dataDir = dataDir;
     this.historyFile = path.join(dataDir, historyFile);
     this._cache = null;
+    const defaultDataDir = path.join(process.cwd(), 'data');
+    this.useSqlite = useSqlite ?? (dataDir === './data' || dataDir === defaultDataDir);
+    if (this.useSqlite) {
+      try {
+        this._sqliteStore = new SqliteFlakyStore({ db });
+      } catch {
+        this.useSqlite = false;
+      }
+    }
   }
 
   async _load() {
@@ -82,6 +92,9 @@ export class FlakyTracker {
    * Idempotent — re-recording the same runId overwrites.
    */
   async recordRun(run) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.recordRun(run);
+    }
     const data = await this._load();
     const summary = buildRunSummary(run);
     // Convert Set to array for JSON serialization
@@ -113,6 +126,9 @@ export class FlakyTracker {
    *   { ruleId, url, passCount, failCount, flakinessRatio, lastFailedAt }
    */
   async detectFlakyTests() {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.detectFlakyTests();
+    }
     const data = await this._load();
 
     // Group runs by URL

@@ -27,6 +27,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { SqliteMonitorStore } from '../storage/monitorStore.js';
 
 const RUN_OPTIONS_SCHEMA = z.object({
   maxPages: z.number().int().min(1).max(100).optional(),
@@ -79,9 +80,18 @@ export function nextRunAt(monitor) {
 // ─── store ───────────────────────────────────────────────────────────
 
 export class MonitorStore {
-  constructor(dataDir = path.join(process.cwd(), 'data')) {
+  constructor(dataDir = path.join(process.cwd(), 'data'), { useSqlite, db } = {}) {
     this.filePath = path.join(dataDir, 'monitors.json');
     this._monitors = null;
+    const defaultDataDir = path.join(process.cwd(), 'data');
+    this.useSqlite = useSqlite ?? (dataDir === defaultDataDir || dataDir === './data');
+    if (this.useSqlite) {
+      try {
+        this._sqliteStore = new SqliteMonitorStore({ db });
+      } catch {
+        this.useSqlite = false;
+      }
+    }
   }
 
   async _load() {
@@ -106,16 +116,25 @@ export class MonitorStore {
   }
 
   async list() {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.list();
+    }
     return [...(await this._load())];
   }
 
   async get(id) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.get(id);
+    }
     const monitors = await this._load();
     return monitors.find(m => m.id === id) || null;
   }
 
   /** Validate + add. Returns { ok, monitor } | { ok:false, error }. */
   async add(input) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.add(input);
+    }
     const parsed = MonitorSchema.safeParse(input);
     if (!parsed.success) {
       return { ok: false, error: parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') };
@@ -130,6 +149,9 @@ export class MonitorStore {
   }
 
   async remove(id) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.remove(id);
+    }
     const monitors = await this._load();
     const next = monitors.filter(m => m.id !== id);
     if (next.length === monitors.length) return false;
@@ -139,6 +161,9 @@ export class MonitorStore {
 
   /** Merge a partial update (usually state fields) into a monitor. */
   async update(id, patch) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.update(id, patch);
+    }
     const monitors = await this._load();
     const idx = monitors.findIndex(m => m.id === id);
     if (idx === -1) return null;
@@ -148,6 +173,9 @@ export class MonitorStore {
   }
 
   async dueMonitors(now = Date.now()) {
+    if (this.useSqlite && this._sqliteStore) {
+      return this._sqliteStore.dueMonitors(now);
+    }
     const monitors = await this._load();
     return monitors.filter(m => isDue(m, now));
   }

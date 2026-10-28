@@ -15,11 +15,19 @@ import { checkAccessibility } from './checks/accessibility.js';
 import { checkSeo } from './checks/seo.js';
 import { checkPerformance } from './checks/performance.js';
 import { checkWorkflows } from './checks/workflows.js';
+import {
+  saveRun as dbSaveRun,
+  getRun as dbGetRun,
+  listRuns as dbListRuns,
+  deleteRun as dbDeleteRun,
+  cleanupOldRuns as dbCleanupOldRuns
+} from '../storage/runStore.js';
+import { JobQueue } from '../storage/jobQueue.js';
 
 const runs = new Map();
 const sseClients = new Map();
 let activeRuns = 0;
-const queue = [];
+const jobQueue = new JobQueue();
 
 const MAX_CONCURRENT_RUNS = 2;
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -102,20 +110,19 @@ export async function createRun(url, options) {
   runs.set(runId, run);
   await saveRun(run);
 
-  if (activeRuns < MAX_CONCURRENT_RUNS) {
-    executeRun(runId).catch(err => logError(`Error in run ${runId}`, err));
-  } else {
-    queue.push(runId);
-  }
+  jobQueue.enqueue({
+    runId,
+    payload: { mode: 'legacy', runId, url, options: run.options },
+  });
 
+  processQueue();
   return runId;
 }
 
-async function saveRun(run) {
+export async function saveRun(run) {
   try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const filePath = path.join(DATA_DIR, `${run.runId}.json`);
-    await fs.writeFile(filePath, JSON.stringify(run, null, 2), 'utf-8');
+    dbSaveRun(run);
+    runs.set(run.runId, run);
   } catch (err) {
     logError(`Failed to save run ${run.runId}`, err);
   }
@@ -126,52 +133,25 @@ export async function getRun(runId) {
     return runs.get(runId);
   }
   try {
-    const filePath = path.join(DATA_DIR, `${runId}.json`);
-    const data = await fs.readFile(filePath, 'utf-8');
-    const run = JSON.parse(data);
-    runs.set(runId, run);
-    return run;
+    const run = dbGetRun(runId);
+    if (run) {
+      runs.set(runId, run);
+      return run;
+    }
+    return null;
   } catch (err) {
+    logError(`Failed to get run ${runId}`, err);
     return null;
   }
 }
 
-export async function listRuns() {
-  const runFiles = [];
+export async function listRuns(opts = {}) {
   try {
-    const files = await fs.readdir(DATA_DIR);
-    for (const file of files) {
-      if (file.endsWith('.json')) {
-        runFiles.push(file);
-      }
-    }
+    return dbListRuns(opts);
   } catch (err) {
-    logError('Failed to read data dir', err);
+    logError('Failed to list runs', err);
+    return [];
   }
-
-  const allRuns = [];
-  for (const file of runFiles) {
-    // Only run files — data/ also holds monitors.json etc.
-    if (!file.startsWith('run_')) continue;
-    try {
-      const data = await fs.readFile(path.join(DATA_DIR, file), 'utf-8');
-      const run = JSON.parse(data);
-      allRuns.push({
-        runId: run.runId,
-        url: run.url,
-        status: run.status,
-        startedAt: run.startedAt,
-        completedAt: run.completedAt,
-        score: run.score,
-        summary: run.summary
-      });
-    } catch (err) {
-      logError(`Failed to read run file ${file}`, err);
-    }
-  }
-
-  allRuns.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
-  return allRuns;
 }
 
 export async function executeRun(runId) {
@@ -298,42 +278,45 @@ export async function executeRun(runId) {
     clearTimeout(timeoutId);
     await closeCrawlSession(browser);
     await saveRun(run);
-    activeRuns--;
-    processQueue();
   }
 }
 
 export function processQueue() {
-  while (activeRuns < MAX_CONCURRENT_RUNS && queue.length > 0) {
-    const nextRunId = queue.shift();
-    executeRun(nextRunId).catch(err => logError(`Error in dequeued run ${nextRunId}`, err));
+  while (activeRuns < MAX_CONCURRENT_RUNS) {
+    const job = jobQueue.acquireNextJob({ maxConcurrent: MAX_CONCURRENT_RUNS });
+    if (!job) break;
+
+    activeRuns++;
+    const isMatrix = job.payload?.mode === 'matrix';
+    const executeFn = isMatrix ? executeRunWithMatrix : executeRun;
+
+    executeFn(job.runId, job.payload)
+      .then(() => {
+        jobQueue.completeJob(job.runId);
+      })
+      .catch((err) => {
+        logError(`Execution error in job ${job.runId}`, err);
+        jobQueue.failJob(job.runId, err.message);
+      })
+      .finally(() => {
+        activeRuns--;
+        processQueue();
+      });
   }
 }
 
-export async function cleanupOldRuns() {
-  const maxAgeMs = config.cleanupMaxAgeMs || 24 * 60 * 60 * 1000;
-  const now = Date.now();
-  
+export async function cleanupOldRuns(maxAgeMs = config.cleanupMaxAgeMs || 24 * 60 * 60 * 1000) {
   try {
-    const files = await fs.readdir(DATA_DIR);
-    for (const file of files) {
-      // Only run files — never delete monitors.json or other data
-      if (!file.startsWith('run_') || !file.endsWith('.json')) continue;
-      const filePath = path.join(DATA_DIR, file);
-      const stats = await fs.stat(filePath);
-      if (now - stats.mtimeMs > maxAgeMs) {
-        const runId = file.replace('.json', '');
-        await fs.unlink(filePath);
-        runs.delete(runId);
-      }
-    }
-    
-    const screenshots = await fs.readdir(SCREENSHOTS_DIR);
-    for (const file of screenshots) {
-      const filePath = path.join(SCREENSHOTS_DIR, file);
-      const stats = await fs.stat(filePath);
-      if (now - stats.mtimeMs > maxAgeMs) {
-        await fs.unlink(filePath);
+    dbCleanupOldRuns(maxAgeMs);
+    if (existsSync(SCREENSHOTS_DIR)) {
+      const now = Date.now();
+      const files = await fs.readdir(SCREENSHOTS_DIR);
+      for (const file of files) {
+        const filePath = path.join(SCREENSHOTS_DIR, file);
+        const stats = await fs.stat(filePath);
+        if (now - stats.mtimeMs > maxAgeMs) {
+          await fs.unlink(filePath).catch(() => {});
+        }
       }
     }
   } catch (err) {
@@ -419,22 +402,31 @@ export async function createRunWithMatrix({ url, options = {}, plan: preApproved
     run.preApprovedPlan = preApprovedPlan;
   }
 
-  if (activeRuns < MAX_CONCURRENT_RUNS) {
-    executeRunWithMatrix(runId).catch(err => logError(`Matrix run ${runId} failed`, err));
-  } else {
-    queue.push(runId);
-  }
+  jobQueue.enqueue({
+    runId,
+    payload: {
+      mode: 'matrix',
+      runId,
+      url,
+      options: run.options,
+      preApprovedPlan,
+    },
+  });
 
+  processQueue();
   return runId;
 }
 
 /**
  * Execute a matrix run — crawl, build plan (or use pre-approved), run matrix.
  */
-async function executeRunWithMatrix(runId) {
-  activeRuns++;
+export async function executeRunWithMatrix(runId, payload) {
   const run = runs.get(runId) || await getRun(runId);
-  if (!run) { activeRuns--; return; }
+  if (!run) return;
+
+  if (payload?.preApprovedPlan && !run.preApprovedPlan) {
+    run.preApprovedPlan = payload.preApprovedPlan;
+  }
 
   run.status = 'running';
   await saveRun(run);
@@ -616,8 +608,6 @@ async function executeRunWithMatrix(runId) {
     clearTimeout(timeoutId);
     if (browserPool) await browserPool.shutdown().catch(() => {});
     await saveRun(run);
-    activeRuns--;
-    processQueue();
   }
 }
 
@@ -776,4 +766,15 @@ async function notifyWebhook(run) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+// ─── Startup: recover interrupted runs and kick off worker loop ──────
+try {
+  const { totalStale, recovered } = jobQueue.recoverStaleJobs();
+  if (totalStale > 0) {
+    info(`JobQueue: recovered ${recovered}/${totalStale} interrupted job(s) from previous session`);
+  }
+  processQueue();
+} catch (err) {
+  // Graceful fallback if database schema is initializing or running in isolation
 }
