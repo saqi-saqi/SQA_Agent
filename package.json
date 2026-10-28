@@ -1,15 +1,17 @@
 {
-  "name": "sqa-agent",
-  "version": "0.2.0",
+  "name": "testflow",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Software QA agent — explores, plans, and runs comprehensive web + API test suites",
+  "description": "TestFlow — Autonomous software QA agent: explores, plans, and executes comprehensive web + API test suites",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
-    "start": "node server/index.js || node dashboard/server.js",
-    "start:dashboard": "node dashboard/server.js"
+    "start": "node dashboard/server.js",
+    "start:dashboard": "node dashboard/server.js",
+    "migrate:sqlite": "node scripts/migrate-json-to-sqlite.js"
   },
   "dependencies": {
     "@axe-core/playwright": "^4.10.0",

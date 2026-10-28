@@ -1,12 +1,14 @@
-# SQA Agent monitoring service — single VPS deployment
-# Usage: docker compose up -d
+# TestFlow — Autonomous SQA Agent
+# Single-command self-hosting: docker compose up -d
 
 services:
-  sqa-agent:
+  testflow:
     build: .
+    image: testflow:latest
+    container_name: testflow
     ports:
       - "8080:8080"
     env_file: .env
     volumes:
-      - ./data:/app/data   # run results + monitors.json persist here
+      - ./data:/app/data   # SQLite database, reports, and screenshots persist here
     restart: unless-stopped
