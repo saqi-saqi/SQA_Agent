@@ -14,8 +14,8 @@ TestFlow is a zero-cost, self-hostable QA testing platform built on Node.js and 
 
 ### 1. Clone & Install
 ```bash
-git clone https://github.com/your-username/testflow.git
-cd testflow
+git clone https://github.com/saqi-saqi/SQA_Agent.git
+cd SQA_Agent
 npm install
 npx playwright install --with-deps chromium
 ```
