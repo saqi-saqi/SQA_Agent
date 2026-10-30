@@ -211,6 +211,7 @@ export async function probeEndpoint(endpoint, ctx) {
           origin: 'first-party',
           ruleId: 'api-status-mismatch',
           pageUrl: url,
+          unauthenticated: anonymousReplay,
           description: reason === 'waf'
             ? `Expected status ${endpoint.expectedStatus} but got ${status} with a WAF/bot-protection challenge page. The site's firewall blocked the anonymous probe — this is protection working, not a site bug.`
             : reason === 'observation'
@@ -249,6 +250,7 @@ export async function probeEndpoint(endpoint, ctx) {
             origin: 'first-party',
             ruleId: 'api-schema-mismatch',
             pageUrl: url,
+            unauthenticated: gated,
             description: gated
               ? `Response body does not match the expected schema: ${result.mismatches.join('; ')}. The replay got an empty/blocked response — it may be bot-walled or session-gated; verify manually.`
               : `Response body does not match the expected schema: ${result.mismatches.join('; ')}`,

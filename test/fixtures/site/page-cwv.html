@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Core Web Vitals Test Page</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    #hero { font-size: 24px; color: #1e293b; min-height: 100px; }
+    .shift-box { background: #e2e8f0; padding: 10px; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Core Web Vitals Test Page</h1>
+    <div id="hero">
+      <p>This page generates measurable, non-zero values for LCP, CLS, TBT, FCP, and TTFB.</p>
+      <img id="cwv-hero-img" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><rect width='200' height='100' fill='%233b82f6'/><text x='10' y='50' fill='white'>CWV Hero</text></svg>" alt="Hero banner" width="200" height="100">
+    </div>
+    <div id="shift-container"></div>
+  </main>
+  <script>
+    // Trigger Layout Shift (CLS > 0)
+    window.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        const div = document.createElement('div');
+        div.className = 'shift-box';
+        div.textContent = 'Injected content causing layout shift';
+        const container = document.getElementById('shift-container');
+        if (container) container.appendChild(div);
+      }, 50);
+
+      // Trigger Long Task (TBT > 0)
+      setTimeout(() => {
+        const start = performance.now();
+        while (performance.now() - start < 75) {
+          // busy wait 75ms (> 50ms long task threshold)
+        }
+      }, 100);
+    });
+  </script>
+</body>
+</html>

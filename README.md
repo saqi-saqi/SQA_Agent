@@ -47,6 +47,60 @@ Or open the dashboard UI at `http://localhost:8080`, type `https://example.com`,
 
 ---
 
+## 🤖 Use TestFlow from Claude Code / Cursor
+
+TestFlow exposes an official [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server running over standard input/output (`stdio`). This allows AI coding agents (Claude Code, Cursor, Codex, or any MCP-compatible client) to call TestFlow's accessibility, API contract, console error, and security checks directly inside their edit-test-fix loop.
+
+### 1. Register the MCP Server
+
+Add this configuration snippet to your `.mcp.json` (Claude Code) or Cursor MCP settings (`~/.cursor/mcp.json` or `.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "testflow": {
+      "command": "node",
+      "args": ["src/mcp/stdio.js"],
+      "env": {
+        "SQA_ALLOW_PRIVATE": "true"
+      }
+    }
+  }
+}
+```
+
+> **Why `SQA_ALLOW_PRIVATE=true`?**
+> TestFlow's enterprise SSRF boundary blocks private IP ranges (`127.0.0.1`, `10.0.0.0/8`, `192.168.0.0/16`, cloud metadata endpoints) by default. Setting `SQA_ALLOW_PRIVATE="true"` permits local loopback scanning so your agent can verify `http://localhost:3000` or local dev servers.
+
+> **Security Note**: The `stdio` transport runs as a local subprocess with zero network exposure. If an HTTP/SSE transport is enabled for remote access in the future, token authentication becomes mandatory.
+
+### 2. Available MCP Tools
+
+| Tool | Purpose | Latency |
+| :--- | :--- | :--- |
+| `quick_check(url, scope?)` | Fast check (axe a11y + API contract + console/network errors) on a single page | ~1–5s |
+| `check_accessibility(url)` | Focused WCAG a11y audit (axe-core) for markup & styling changes | ~1–3s |
+| `check_api_contract(url, endpoints?)` | Probes REST endpoints for unexpected status codes or broken response schemas | ~100ms–2s |
+| `explain_finding(rule_id)` | Plain-language explanation + recommended fix for any rule ID (e.g. `image-alt`) | Immediate |
+| `start_full_scan(url, options?)` | Asynchronous deep matrix scan (crawls, multi-browser, viewports). Returns `job_id` | Immediate |
+| `get_scan_status(job_id)` | Polls status (`pending` | `running` | `complete` | `failed`) and pages scanned | Immediate |
+| `get_scan_report(job_id, verbosity?)` | Invariant-validated structured JSON report with CONFIRMED findings | Immediate |
+
+### 3. Example Prompts for Your Coding Agent
+
+Once connected, you can give your AI agent natural prompts like:
+
+- **Pre-commit verification**:
+  > *"Run a quick check against http://localhost:3000 before I commit this change."*
+- **A11y regression check**:
+  > *"I just refactored the checkout modal and form inputs. Run check_accessibility against http://localhost:3000/checkout and fix any violations."*
+- **Investigate & repair**:
+  > *"The quick check failed on rule `api-status-mismatch`. Call explain_finding to understand the requirement, find the route handler, and fix the mismatch."*
+- **Deep matrix scan**:
+  > *"Start a full scan on http://localhost:3000 with start_full_scan, poll get_scan_status until done, and summarize confirmed bugs."*
+
+---
+
 ## 🐳 Self-Host with Docker (1 Command)
 
 TestFlow runs on 100% free, official Docker base images with zero external services:

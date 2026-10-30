@@ -255,6 +255,17 @@ export async function executeRun(runId) {
     run.findings = findings;
     run.score = calculateScore(findings);
     run.summary = summarizeFindings(findings, pages);
+
+    // Invariant check in non-production / test mode
+    if (process.env.NODE_ENV !== 'production' || process.env.SQA_STRICT === 'true') {
+      try {
+        const { validateReport } = await import('../reporting/invariants.js');
+        validateReport(run, { throwOnError: process.env.NODE_ENV === 'test' || process.env.SQA_STRICT === 'true' });
+      } catch (invErr) {
+        logError(`Invariant validation failure in run ${runId}: ${invErr.message}`);
+        if (process.env.NODE_ENV === 'test' || process.env.SQA_STRICT === 'true') throw invErr;
+      }
+    }
     
     // Strip Playwright page instances and raw capture data before persisting
     run.pages = pages.map(p => {
@@ -560,8 +571,34 @@ export async function executeRunWithMatrix(runId, payload) {
 
     run.findings = matrixResult.findings;
     run.matrixStats = matrixResult.stats;
-    run.score = calculateScore(matrixResult.findings);
-    run.summary = summarizeFindings(matrixResult.findings, pages.length);
+    run.coverageFailures = matrixResult.coverageFailures || [];
+
+    const pagesAttempted = pages.length;
+    const failedUrls = new Set((run.coverageFailures || []).map(f => f.pageUrl));
+    const pagesScanned = Math.max(0, pagesAttempted - failedUrls.size);
+    const coverageRatio = pagesAttempted > 0 ? pagesScanned / pagesAttempted : 1.0;
+    run.coverage = { pagesAttempted, pagesScanned, coverageRatio };
+
+    const scoreOpts = {
+      pagesAttempted,
+      pagesScanned,
+      coverageRatio,
+      excludeUnauthenticated: run.options?.excludeUnauthenticated,
+    };
+
+    run.score = calculateScore(matrixResult.findings, scoreOpts);
+    run.summary = summarizeFindings(matrixResult.findings, pages.length, scoreOpts);
+
+    // Invariant check in non-production / test mode
+    if (process.env.NODE_ENV !== 'production' || process.env.SQA_STRICT === 'true') {
+      try {
+        const { validateReport } = await import('../reporting/invariants.js');
+        validateReport(run, { throwOnError: process.env.NODE_ENV === 'test' || process.env.SQA_STRICT === 'true' });
+      } catch (invErr) {
+        logError(`Invariant validation failure in matrix run ${runId}: ${invErr.message}`);
+        if (process.env.NODE_ENV === 'test' || process.env.SQA_STRICT === 'true') throw invErr;
+      }
+    }
     run.pages = pages.map(p => {
       const { page, consoleLogs, pageExceptions, networkFailures, networkErrors, ...rest } = p;
       return rest;

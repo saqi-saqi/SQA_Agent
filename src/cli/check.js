@@ -48,6 +48,8 @@ function parseArgs(argv) {
       opts.maxDepth = Number(args[++i]) || 1;
     } else if (arg === '--json') {
       opts.json = true;
+    } else if (arg === '--strict') {
+      opts.strict = true;
     }
   }
 
@@ -132,10 +134,15 @@ async function runCheck({ url, timeout, maxPages, maxDepth }) {
 
 export async function checkMain(argv = process.argv) {
   try {
-    const { url, failOn, timeout, maxPages, maxDepth, json } = parseArgs(argv);
+    const { url, failOn, timeout, maxPages, maxDepth, json, strict } = parseArgs(argv);
     process.stdout.write(`SQA Agent CI check — ${url}\n`);
 
     const run = await runCheck({ url, timeout, maxPages, maxDepth });
+
+    if (strict) {
+      const { validateReport } = await import('../reporting/invariants.js');
+      validateReport(run, { throwOnError: true });
+    }
     const findings = run.findings || [];
     const compliance = await (async () => {
       try {

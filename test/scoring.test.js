@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateScore, summarizeFindings } from '../src/services/scoring.js';
+import { verdict } from '../src/services/report.js';
 
 describe('calculateScore', () => {
   it('returns 100 for no findings', () => {
@@ -134,5 +135,46 @@ describe('summarizeFindings', () => {
     ];
     const s = summarizeFindings(findings, 1);
     assert.equal(s.confirmedBugs, 1);
+  });
+
+  it('Bug 3 regression: excludes SUSPECTED unauthenticated finding from score calculation and top-level findings count', () => {
+    const findings = [
+      {
+        id: 'NET-001',
+        title: 'API POST /api/rest/v1/eventing/infobatch returned unexpected status',
+        severity: 'low',
+        confidence: 'suspected',
+        category: 'network',
+        findingType: 'environmental',
+        ruleId: 'api-status-mismatch',
+        pageUrl: 'https://example.com/api',
+        unauthenticated: true,
+        description: 'Expected status 200 but got 400. The probe replayed a captured POST request anonymously - the endpoint may simply require a session or CSRF token.',
+      },
+    ];
+
+    // Score with unauthenticated excluded (default: true)
+    const score = calculateScore(findings);
+    assert.equal(score, 100, 'Score should be 100 when unauthenticated finding is excluded');
+
+    // Summary excludes from totalFindings and confirmedBugs
+    const summary = summarizeFindings(findings, 1);
+    assert.equal(summary.totalFindings, 0, 'Unauthenticated probe must NOT count toward headline totalFindings');
+    assert.equal(summary.confirmedBugs, 0, 'Unauthenticated probe must NOT count toward confirmedBugs');
+    assert.equal(summary.unauthenticatedProbes, 1, 'Should record in unauthenticatedProbes');
+
+    // Aggressive mode: score when unauthenticated is NOT excluded
+    const aggressiveScore = calculateScore(findings, { excludeUnauthenticated: false });
+    assert.ok(aggressiveScore < 100, 'Score should deduct when aggressive mode is enabled');
+  });
+
+  it('Scoring regression: 60% page coverage with zero findings does NOT produce a 90+ Excellent score', () => {
+    // 5 attempted, 3 scanned = 60% coverage, 0 findings on the pages that did load
+    const score = calculateScore([], { pagesAttempted: 5, pagesScanned: 3 });
+    assert.ok(score <= 60, `Expected score <= 60, got ${score}`);
+    assert.ok(score < 90, 'Score must NOT be 90+');
+
+    const v = verdict(score, 3 / 5);
+    assert.notEqual(v.label, 'Excellent', 'Verdict label must NOT be Excellent for 60% coverage');
   });
 });

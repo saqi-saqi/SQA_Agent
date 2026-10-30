@@ -18,6 +18,7 @@
  */
 
 import { runExecutor, hasExecutor } from '../services/executorRegistry.js';
+import { canonicalizeUrl } from '../utils/classify.js';
 
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 
@@ -31,6 +32,8 @@ function worstSeverity(a, b) {
  * (Executors that don't care about viewport/role see the same plan.)
  */
 function buildCellContext(cell, baseCtx) {
+  const baseFailures = baseCtx.pageFailures || (baseCtx.pageFailures = new Map());
+
   const cellCtx = {
     ...baseCtx,
     plan: baseCtx.plan,  // executors read plan.* arrays themselves
@@ -41,6 +44,22 @@ function buildCellContext(cell, baseCtx) {
       viewport: cell.viewport,
       role: cell.role,
       cellId: cell.id,
+    },
+    isPageFailed: (url) => {
+      const norm = canonicalizeUrl(url || '');
+      return baseFailures.has(norm);
+    },
+    recordPageFailure: ({ url, error, executor }) => {
+      const norm = canonicalizeUrl(url || '');
+      if (!baseFailures.has(norm)) {
+        baseFailures.set(norm, {
+          url,
+          error: error || 'Page load failure',
+          blockedExecutors: new Set(executor ? [executor] : []),
+        });
+      } else {
+        if (executor) baseFailures.get(norm).blockedExecutors.add(executor);
+      }
     },
   };
 
@@ -121,34 +140,57 @@ async function runCell(cell, baseCtx) {
 }
 
 /**
- * Dedup findings across cells. Same ruleId + pageUrl → merge into one finding.
+ * Extract a stable selector or affected node signature from a finding.
+ */
+export function getNodeSignature(finding) {
+  if (finding.selector) return String(finding.selector).trim();
+  if (finding.target) return Array.isArray(finding.target) ? finding.target.join(' ') : String(finding.target).trim();
+  if (finding.evidence) {
+    const targets = [];
+    const matches = String(finding.evidence).matchAll(/Target:\s*([^\n]+)/g);
+    for (const match of matches) {
+      targets.push(match[1].trim());
+    }
+    if (targets.length > 0) return targets.sort().join('; ');
+  }
+  return '';
+}
+
+/**
+ * Dedup findings across cells. Same ruleId + affected node signature + pageUrl → merge into one finding.
  * - occurrences: sum across cells
  * - affectedPages: union
  * - severity: worst
  * - matrixCells: list of cell IDs where observed
  */
-function dedupFindings(findings) {
+export function dedupFindings(findings) {
   const merged = new Map();
 
   for (const finding of findings) {
-    const key = `${finding.ruleId || 'gen'}::${finding.pageUrl || ''}`;
+    const ruleId = finding.ruleId || 'gen';
+    const selector = getNodeSignature(finding);
+    const rawUrl = finding.pageUrl || finding.url || '';
+    const normUrl = canonicalizeUrl(rawUrl);
+    const key = `${ruleId}::${selector}::${normUrl}`;
+
     if (!merged.has(key)) {
       merged.set(key, {
         ...finding,
         occurrences: finding.occurrences || 1,
-        affectedPages: new Set(finding.affectedPages || (finding.pageUrl ? [finding.pageUrl] : [])),
+        affectedPages: new Set(finding.affectedPages || (rawUrl ? [rawUrl] : [])),
         matrixCells: new Set(finding.matrixCell?.cellId ? [finding.matrixCell.cellId] : []),
       });
     } else {
       const existing = merged.get(key);
-      existing.occurrences += finding.occurrences || 1;
+      existing.occurrences += (finding.occurrences || 1);
       for (const p of (finding.affectedPages || [])) existing.affectedPages.add(p);
-      if (finding.pageUrl) existing.affectedPages.add(finding.pageUrl);
+      if (rawUrl) existing.affectedPages.add(rawUrl);
       if (finding.matrixCell?.cellId) existing.matrixCells.add(finding.matrixCell.cellId);
       existing.severity = worstSeverity(existing.severity, finding.severity);
-      // Don't lose non-empty evidence/description
+      // Don't lose non-empty evidence/description/selector
       if (!existing.description && finding.description) existing.description = finding.description;
       if (!existing.evidence && finding.evidence) existing.evidence = finding.evidence;
+      if (!existing.selector && finding.selector) existing.selector = finding.selector;
     }
   }
 
@@ -249,9 +291,36 @@ export async function runMatrix({
   // Dedup across cells
   const finalFindings = dedup ? dedupFindings(allFindings) : allFindings;
 
+  // Build unified coverage failure findings if any page load failures occurred
+  const coverageFailures = [];
+  if (baseCtx.pageFailures?.size > 0) {
+    for (const failure of baseCtx.pageFailures.values()) {
+      const blocked = Array.from(failure.blockedExecutors);
+      const covFinding = createFinding({
+        title: `Page load failed: ${failure.url}`,
+        severity: 'info',
+        confidence: 'high',
+        category: 'Scan Coverage',
+        findingType: 'coverage-failure',
+        origin: 'first-party',
+        ruleId: 'page-load-failure',
+        pageUrl: failure.url,
+        description: `Page failed to load (${(failure.error || '').split('\n')[0]}). The following executors could not run: ${blocked.join(', ')}`,
+        evidence: failure.error || '',
+        occurrences: 1,
+        affectedPages: [failure.url],
+        blockedExecutors: blocked,
+      });
+      coverageFailures.push(covFinding);
+    }
+  }
+
+  // Include coverage failure records in findings
+  finalFindings.push(...coverageFailures);
+
   onEvent?.(`Matrix complete: ${finalFindings.length} findings across ${allStats.completedCells} cells`);
 
-  return { findings: finalFindings, stats: allStats };
+  return { findings: finalFindings, coverageFailures, stats: allStats };
 }
 
 /**

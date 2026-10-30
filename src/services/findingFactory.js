@@ -12,6 +12,8 @@ const CATEGORY_PREFIXES = {
   accessibility: 'A11Y',
   seo: 'SEO',
   performance: 'PERF',
+  'Scan Coverage': 'COV',
+  coverage: 'COV',
 };
 
 export function createFindingFactory() {
@@ -53,6 +55,10 @@ export function createFindingFactory() {
     occurrences,
     affectedPages,
     affectedElements,
+    selector,
+    blockedExecutors,
+    unauthenticated,
+    ...rest
   }) {
     const prefix = CATEGORY_PREFIXES[category] || 'GEN';
     counters[prefix] = (counters[prefix] || 0) + 1;
@@ -76,6 +82,10 @@ export function createFindingFactory() {
       occurrences:      occurrences || 1,
       affectedPages:    affectedPages || (pageUrl ? [pageUrl] : []),
       affectedElements: affectedElements || null,
+      selector:         selector || null,
+      ...(blockedExecutors ? { blockedExecutors } : {}),
+      ...(unauthenticated != null ? { unauthenticated } : {}),
+      ...rest,
     };
   };
 }

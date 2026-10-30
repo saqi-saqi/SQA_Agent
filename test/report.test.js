@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateHtmlReport, generateJsonReport } from '../src/services/report.js';
+import { generateHtmlReport, generateJsonReport, verdict } from '../src/services/report.js';
 
 const sampleRun = {
   runId: 'run_test_123',
@@ -184,5 +184,81 @@ describe('generateHtmlReport (regression)', () => {
     assert.match(html, /Broken link/);
     assert.match(html, /Broken anchor/);
     assert.match(html, /78/);  // score
+  });
+
+  it('Bug 2 & 3 regression: report HTML and JSON segregate coverage failures and unauthenticated probes', () => {
+    const runWithIssues = {
+      ...sampleRun,
+      summary: null,
+      score: 54.3,
+      coverage: { pagesAttempted: 5, pagesScanned: 3, coverageRatio: 0.6 },
+      coverageFailures: [
+        {
+          id: 'COV-001',
+          title: 'Page load failed: https://example.com/degrees',
+          category: 'Scan Coverage',
+          findingType: 'coverage-failure',
+          ruleId: 'page-load-failure',
+          pageUrl: 'https://example.com/degrees',
+          description: 'page.goto: Timeout 30000ms exceeded.',
+          blockedExecutors: ['accessibility-deep', 'perf'],
+        },
+      ],
+      findings: [
+        {
+          id: 'LINK-001',
+          title: 'Broken link',
+          severity: 'high',
+          confidence: 'confirmed',
+          category: 'links',
+          findingType: 'bug',
+          pageUrl: 'https://example.com/',
+          occurrences: 1,
+        },
+        {
+          id: 'NET-001',
+          title: 'API POST /api/replay returned 400',
+          severity: 'low',
+          confidence: 'suspected',
+          category: 'network',
+          findingType: 'environmental',
+          ruleId: 'api-status-mismatch',
+          pageUrl: 'https://example.com/api',
+          unauthenticated: true,
+          description: 'Probe replayed anonymously - requires session or CSRF token.',
+        },
+      ],
+    };
+
+    const html = generateHtmlReport(runWithIssues);
+    // Check coverage failure section
+    assert.match(html, /Scan Coverage/);
+    assert.match(html, /Timeout 30000ms exceeded/);
+    assert.match(html, /accessibility-deep, perf/);
+
+    // Check unauthenticated probe section
+    assert.match(html, /Needs manual verification/);
+    assert.match(html, /requires session or CSRF token/);
+
+    // Check coverage line displayed directly next to score
+    assert.match(html, /3\/5 pages scanned \(60% coverage\)/);
+
+    // Check JSON report
+    const json = JSON.parse(generateJsonReport(runWithIssues));
+    assert.equal(json.coverage.coverageRatio, 0.6);
+    assert.equal(json.coverageFailures.length, 1);
+    assert.equal(json.unauthenticatedProbes.length, 1);
+    assert.equal(json.summary.totalFindings, 1, 'Only genuine content findings in totalFindings');
+  });
+
+  it('Scoring regression: verdict caps label below Excellent when coverage is below 80%', () => {
+    // 95 score with 70% coverage
+    const v = verdict(95, 0.7);
+    assert.notEqual(v.label, 'Excellent');
+    assert.equal(v.label, 'Incomplete (Good)');
+
+    // 95 score with 90% coverage
+    const vHigh = verdict(95, 0.9);
+    assert.equal(vHigh.label, 'Excellent');
   });
 });

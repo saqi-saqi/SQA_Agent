@@ -20,6 +20,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { config } from '../utils/config.js';
 
 /**
  * Pure-function diff: given two PNG buffers (raw RGBA pixels), compute
@@ -60,7 +61,7 @@ export async function captureScreenshot(page, baseline, screenshotsDir, runId) {
     await page.setViewportSize({ width: baseline.viewport.width, height: baseline.viewport.height });
   }
 
-  await page.goto(baseline.pageUrl, { waitUntil: 'load', timeout: 30000 });
+  await page.goto(baseline.pageUrl, { waitUntil: 'load', timeout: config?.pageTimeoutMs || 30000 });
 
   // Apply masks — mask selectors are CSS selectors whose area should be
   // excluded from the diff (ads, dynamic content, etc.)
@@ -102,6 +103,11 @@ export default async function visualExecutor(ctx) {
 
   for (const baseline of baselines) {
     if (ctx.signal?.aborted) break;
+
+    if (ctx.isPageFailed?.(baseline.pageUrl)) {
+      ctx.recordPageFailure?.({ url: baseline.pageUrl, executor: 'visual' });
+      continue;
+    }
 
     const page = await ctx.context.newPage({ viewport: baseline.viewport });
     try {
@@ -154,17 +160,23 @@ export default async function visualExecutor(ctx) {
         }));
       }
     } catch (err) {
-      findings.push(ctx.createFinding({
-        title: `Visual capture failed for ${baseline.pageUrl}`,
-        severity: 'low',
-        confidence: 'high',
-        category: 'network',
-        findingType: 'environmental',
-        origin: 'first-party',
-        ruleId: 'visual-capture-error',
-        pageUrl: baseline.pageUrl,
-        description: err.message,
-      }));
+      if (ctx.recordPageFailure) {
+        ctx.recordPageFailure({ url: baseline.pageUrl, error: err.message, executor: 'visual' });
+      } else {
+        findings.push(ctx.createFinding({
+          title: `Page load failed: ${baseline.pageUrl}`,
+          severity: 'info',
+          confidence: 'high',
+          category: 'Scan Coverage',
+          findingType: 'coverage-failure',
+          origin: 'first-party',
+          ruleId: 'page-load-failure',
+          pageUrl: baseline.pageUrl,
+          description: err.message,
+          evidence: err.message,
+          blockedExecutors: ['visual'],
+        }));
+      }
     } finally {
       await page.close().catch(() => {});
     }

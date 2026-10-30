@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { runMatrix } from '../src/matrix/matrixRunner.js';
+import { runMatrix, dedupFindings } from '../src/matrix/matrixRunner.js';
+import { summarizeFindings } from '../src/services/scoring.js';
 import {
   registerExecutor,
   clearExecutors,
@@ -228,5 +229,92 @@ describe('runMatrix', () => {
     assert.equal(result.stats.totalCells, 1);
     assert.equal(result.stats.completedCells, 1);
     assert.equal(result.findings.length, 1);
+  });
+
+  it('Bug 1 regression: collapses two findings with identical ruleId, selector, and URL into one finding with occurrences = 2', () => {
+    const f1 = {
+      ruleId: 'axe-region',
+      selector: '.css-8qpjjf',
+      pageUrl: 'https://example.com/campus',
+      occurrences: 1,
+      severity: 'medium',
+      confidence: 'confirmed',
+      matrixCell: { cellId: 'chromium:desktop:anon' },
+    };
+    const f2 = {
+      ruleId: 'axe-region',
+      selector: '.css-8qpjjf',
+      pageUrl: 'https://example.com/campus',
+      occurrences: 1,
+      severity: 'medium',
+      confidence: 'confirmed',
+      matrixCell: { cellId: 'chromium:mobile:anon' },
+    };
+
+    const merged = dedupFindings([f1, f2]);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].occurrences, 2);
+    assert.equal(merged[0].ruleId, 'axe-region');
+    assert.equal(merged[0].selector, '.css-8qpjjf');
+    assert.deepEqual(merged[0].matrixCells.sort(), ['chromium:desktop:anon', 'chromium:mobile:anon'].sort());
+  });
+
+  it('Bug 2 regression: simulates one page.goto timeout, producing exactly one coverage-failure record excluded from findings/bugs counts', async () => {
+    clearExecutors();
+    // Executor 1 simulates catching page.goto timeout
+    registerExecutor('mock-a11y', async (ctx) => {
+      ctx.recordPageFailure({
+        url: 'https://example.com/timeout',
+        error: 'page.goto: Timeout 30000ms exceeded.',
+        executor: 'mock-a11y',
+      });
+      return { findings: [] };
+    });
+
+    // Executor 2 sees page already failed and appends itself to blocked list
+    registerExecutor('mock-perf', async (ctx) => {
+      if (ctx.isPageFailed('https://example.com/timeout')) {
+        ctx.recordPageFailure({
+          url: 'https://example.com/timeout',
+          executor: 'mock-perf',
+        });
+      }
+      return { findings: [] };
+    });
+
+    const timeoutPlan = {
+      ...samplePlan,
+      executors: ['mock-a11y', 'mock-perf'],
+    };
+
+    const cells = [{
+      id: 'cell-timeout',
+      browser: null,
+      viewport: null,
+      role: 'anon',
+      executors: ['mock-a11y', 'mock-perf'],
+      needsBrowser: false,
+    }];
+
+    const result = await runMatrix({
+      plan: timeoutPlan,
+      cells,
+      browserPool: null,
+      ...baseCtx(),
+    });
+
+    // Exactly one coverage-failure record is produced for that URL
+    assert.equal(result.coverageFailures.length, 1);
+    const cov = result.coverageFailures[0];
+    assert.equal(cov.pageUrl, 'https://example.com/timeout');
+    assert.equal(cov.category, 'Scan Coverage');
+    assert.equal(cov.findingType, 'coverage-failure');
+    assert.deepEqual(cov.blockedExecutors.sort(), ['mock-a11y', 'mock-perf'].sort());
+
+    // Summarize and verify it is EXCLUDED from findings count and confirmed bugs count
+    const summary = summarizeFindings(result.findings, 1);
+    assert.equal(summary.totalFindings, 0, 'Coverage failure must NOT count toward totalFindings');
+    assert.equal(summary.confirmedBugs, 0, 'Coverage failure must NOT count toward confirmedBugs');
+    assert.equal(summary.coverageFailures, 1, 'Should record exactly 1 coverageFailure in summary');
   });
 });

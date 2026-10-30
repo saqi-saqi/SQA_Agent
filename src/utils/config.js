@@ -28,8 +28,12 @@ export const config = Object.freeze({
   maxPagesHardLimit: parseInt(process.env.SQA_MAX_PAGES_HARD || process.env.MAX_PAGES_HARD_LIMIT || '100'),
 
   // Timeouts
-  maxRunTimeMs: parseInt(process.env.SQA_MAX_RUN_MS || process.env.MAX_RUN_TIME_MS || '300000'),
-  pageTimeoutMs: parseInt(process.env.SQA_PAGE_TIMEOUT_MS || process.env.PAGE_TIMEOUT_MS || '30000'),
+  get maxRunTimeMs() {
+    return parseInt(process.env.SQA_MAX_RUN_MS || process.env.MAX_RUN_TIME_MS || '300000');
+  },
+  get pageTimeoutMs() {
+    return parseInt(process.env.SQA_PAGE_TIMEOUT_MS || process.env.PAGE_TIMEOUT_MS || '30000');
+  },
   maxResponseSizeBytes: parseInt(process.env.MAX_RESPONSE_SIZE_BYTES || '10485760'),
 
   // Data retention
@@ -48,4 +52,10 @@ export const config = Object.freeze({
 
   // Webhook — POST a run summary to this URL after each monitored run
   webhookUrl: process.env.SQA_WEBHOOK_URL || '',
+
+  // Findings & scoring: exclude SUSPECTED-unauthenticated probe findings from scoring by default
+  // Set SQA_EXCLUDE_UNAUTHENTICATED=false for aggressive detection
+  excludeUnauthenticatedFromScoring:
+    process.env.SQA_EXCLUDE_UNAUTHENTICATED !== 'false' &&
+    process.env.EXCLUDE_UNAUTHENTICATED !== 'false',
 });

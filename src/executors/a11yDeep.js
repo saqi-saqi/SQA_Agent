@@ -15,6 +15,7 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { config } from '../utils/config.js';
 
 const AXE_RULE_TO_SEVERITY = {
   critical: 'critical',
@@ -69,6 +70,8 @@ export function axeResultsToFindings(results, pageUrl, createFinding) {
   for (const violation of results.violations || []) {
     const severity = AXE_RULE_TO_SEVERITY[violation.impact] || 'medium';
     const nodeCount = violation.nodes?.length || 0;
+    const targets = violation.nodes?.map(n => Array.isArray(n.target) ? n.target.join(' ') : n.target).filter(Boolean);
+    const selector = targets && targets.length ? targets.slice(0, 5).join('; ') : null;
 
     findings.push(createFinding({
       title: `a11y: ${violation.help} (${violation.id})`,
@@ -84,6 +87,7 @@ export function axeResultsToFindings(results, pageUrl, createFinding) {
       occurrences: nodeCount,
       affectedPages: [pageUrl],
       affectedElements: nodeCount,
+      selector,
       suggestedFix: violation.helpUrl
         ? `See: ${violation.helpUrl}`
         : 'Refactor the markup to satisfy the rule.',
@@ -108,9 +112,14 @@ export default async function a11yDeepExecutor(ctx) {
   for (const pageInfo of pages) {
     if (ctx.signal?.aborted) break;
 
+    if (ctx.isPageFailed?.(pageInfo.url)) {
+      ctx.recordPageFailure?.({ url: pageInfo.url, executor: 'accessibility-deep' });
+      continue;
+    }
+
     const page = await ctx.context.newPage();
     try {
-      await page.goto(pageInfo.url, { waitUntil: 'load', timeout: 30000 });
+      await page.goto(pageInfo.url, { waitUntil: 'load', timeout: config?.pageTimeoutMs || 30000 });
 
       // Inject axe-core from the local install (CSP-safe). Fall back to the
       // CDN only if the local package is missing. Skip if both fail.
@@ -140,18 +149,23 @@ export default async function a11yDeepExecutor(ctx) {
       const results = await runAxeOnPage(page, rules);
       findings.push(...axeResultsToFindings(results, pageInfo.url, ctx.createFinding));
     } catch (err) {
-      findings.push(ctx.createFinding({
-        title: `a11y-deep failed on ${pageInfo.url}`,
-        severity: 'low',
-        confidence: 'high',
-        category: 'accessibility',
-        findingType: 'environmental',
-        origin: 'first-party',
-        ruleId: 'axe-page-error',
-        pageUrl: pageInfo.url,
-        description: err.message,
-        suggestedFix: 'Investigate the page-load failure.',
-      }));
+      if (ctx.recordPageFailure) {
+        ctx.recordPageFailure({ url: pageInfo.url, error: err.message, executor: 'accessibility-deep' });
+      } else {
+        findings.push(ctx.createFinding({
+          title: `Page load failed: ${pageInfo.url}`,
+          severity: 'info',
+          confidence: 'high',
+          category: 'Scan Coverage',
+          findingType: 'coverage-failure',
+          origin: 'first-party',
+          ruleId: 'page-load-failure',
+          pageUrl: pageInfo.url,
+          description: err.message,
+          evidence: err.message,
+          blockedExecutors: ['accessibility-deep'],
+        }));
+      }
     } finally {
       await page.close().catch(() => {});
     }

@@ -1,4 +1,5 @@
 import { computeCompliance } from './compliance.js';
+import { isCoverageFailure, isUnauthenticatedProbe, calculateScore } from './scoring.js';
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -22,12 +23,21 @@ function redactHeadersDeep(headers) {
   return out;
 }
 
-function verdict(score) {
+export function verdict(score, coverageRatio = 1.0) {
   if (score == null) return { label: 'Awaiting results', tone: 'muted' };
-  if (score >= 90) return { label: 'Excellent', tone: '#16a34a' };
-  if (score >= 75) return { label: 'Good', tone: '#2563eb' };
-  if (score >= 50) return { label: 'Needs work', tone: '#d97706' };
-  return { label: 'At risk', tone: '#dc2626' };
+  let label;
+  let tone;
+  if (score >= 90) { label = 'Excellent'; tone = '#16a34a'; }
+  else if (score >= 75) { label = 'Good'; tone = '#2563eb'; }
+  else if (score >= 50) { label = 'Needs work'; tone = '#d97706'; }
+  else { label = 'At risk'; tone = '#dc2626'; }
+
+  // Below 80% coverage, cap verdict label below Excellent
+  if (coverageRatio != null && coverageRatio < 0.8 && label === 'Excellent') {
+    label = 'Incomplete (Good)';
+    tone = '#2563eb';
+  }
+  return { label, tone };
 }
 
 function scoreRingSvg(score, size = 150) {
@@ -129,14 +139,31 @@ function fixChecklistHtml(run) {
 
 export function generateHtmlReport(run) {
   const date = new Date(run.startedAt).toLocaleString();
-  const v = verdict(run.score);
+
+  const allFindings = run.findings || [];
+  const coverageFailuresList = run.coverageFailures && run.coverageFailures.length > 0
+    ? run.coverageFailures
+    : allFindings.filter(isCoverageFailure);
+  const unauthProbesList = allFindings.filter(isUnauthenticatedProbe);
+  const contentFindings = allFindings.filter(f => !isCoverageFailure(f) && !isUnauthenticatedProbe(f));
+
+  const failedUrls = new Set(coverageFailuresList.map(f => f.pageUrl).filter(Boolean));
+  const pagesAttempted = run.coverage?.pagesAttempted ?? (run.pages ? run.pages.length : (run.options?.maxPages || 1));
+  const pagesScanned = run.coverage?.pagesScanned ?? Math.max(0, pagesAttempted - failedUrls.size);
+  const coverageRatio = run.coverage?.coverageRatio ?? (pagesAttempted > 0 ? pagesScanned / pagesAttempted : 1.0);
+
+  const displayScore = (run.coverage == null && coverageRatio < 1.0 && run.score != null)
+    ? calculateScore(allFindings, { pagesAttempted, pagesScanned, coverageRatio })
+    : run.score;
+
+  const v = verdict(displayScore, coverageRatio);
 
   let findingsHtml = '';
 
-  if (!run.findings || run.findings.length === 0) {
+  if (contentFindings.length === 0) {
     findingsHtml = '<p>No findings. Great job!</p>';
   } else {
-    const grouped = run.findings.reduce((acc, f) => {
+    const grouped = contentFindings.reduce((acc, f) => {
       const cat = f.category || 'general';
       const sev = f.severity || 'info';
       if (!acc[cat]) acc[cat] = {};
@@ -213,10 +240,58 @@ export function generateHtmlReport(run) {
     }
   }
 
+  let coverageSectionHtml = '';
+  if (coverageFailuresList.length > 0) {
+    coverageSectionHtml = `
+    <section class="scan-coverage" style="margin: 24px 0; padding: 20px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px;">
+      <h2 style="color: #991b1b; margin-top: 0;">Scan Coverage (${coverageFailuresList.length} page(s) failed to load)</h2>
+      <p style="color: #7f1d1d; font-size: 14px; margin-bottom: 16px;">
+        The following page(s) failed to load or encountered timeouts during the scan. These are infrastructure issues rather than quality defects, but they reduce scan coverage.
+      </p>`;
+    for (const f of coverageFailuresList) {
+      const blocked = f.blockedExecutors?.length ? f.blockedExecutors.join(', ') : 'All page checks';
+      coverageSectionHtml += `
+      <div class="finding-card" style="border-left: 4px solid #ef4444; background: #fff; margin-bottom: 12px; padding: 14px; border-radius: 4px;">
+        <h4 style="margin: 0 0 8px 0;">${escapeHtml(f.title)} <span class="badge low">COVERAGE</span></h4>
+        <p style="margin: 4px 0;"><strong>Page:</strong> <a href="${escapeHtml(f.pageUrl)}" target="_blank">${escapeHtml(f.pageUrl)}</a></p>
+        <p style="margin: 4px 0;"><strong>Blocked executors:</strong> ${escapeHtml(blocked)}</p>
+        <p style="margin: 4px 0; color: #475569;"><strong>Error:</strong> ${escapeHtml(f.description || '')}</p>
+        ${f.evidence ? `<pre style="margin-top: 8px; background: #f8fafc; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;">${escapeHtml(f.evidence)}</pre>` : ''}
+      </div>`;
+    }
+    coverageSectionHtml += `</section>`;
+  }
+
+  let unauthSectionHtml = '';
+  if (unauthProbesList.length > 0) {
+    unauthSectionHtml = `
+    <section class="unauthenticated-probes" style="margin: 24px 0; padding: 20px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;">
+      <h2 style="color: #92400e; margin-top: 0;">Needs manual verification (${unauthProbesList.length} unauthenticated probe results)</h2>
+      <p style="color: #78350f; font-size: 14px; margin-bottom: 16px;">
+        The probe replayed these captured API requests anonymously without session credentials or CSRF tokens. They returned unexpected statuses that may be caused by missing authentication rather than real defects.
+      </p>`;
+    for (const f of unauthProbesList) {
+      unauthSectionHtml += `
+      <div class="finding-card" style="border-left: 4px solid #f59e0b; background: #fff; margin-bottom: 12px; padding: 14px; border-radius: 4px;">
+        <h4 style="margin: 0 0 8px 0;">${escapeHtml(f.title)} <span class="badge" style="background: #f59e0b; color: #fff;">SUSPECTED</span> <span class="badge origin">First-party</span></h4>
+        <p style="margin: 4px 0;"><strong>Endpoint / URL:</strong> <a href="${escapeHtml(f.pageUrl)}" target="_blank">${escapeHtml(f.pageUrl)}</a></p>
+        <p style="margin: 4px 0; color: #475569;">${escapeHtml(f.description || '')}</p>
+        ${f.evidence ? `<pre style="margin-top: 8px; background: #f8fafc; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto;">${escapeHtml(f.evidence)}</pre>` : ''}
+        ${f.suggestedFix ? `<p style="margin: 8px 0 0 0;"><strong>Suggested Fix:</strong> ${escapeHtml(f.suggestedFix)}</p>` : ''}
+      </div>`;
+    }
+    unauthSectionHtml += `</section>`;
+  }
+
   const s = run.summary || {};
-  const totalFindings = s.totalFindings || (run.findings ? run.findings.length : 0);
-  const confirmedBugs = s.confirmedBugs || 0;
-  const totalOccurrences = s.totalOccurrences || totalFindings;
+  const isLegacySummary = s.coverageFailures == null && (coverageFailuresList.length > 0 || unauthProbesList.length > 0);
+  const totalFindings = isLegacySummary ? contentFindings.length : (s.totalFindings ?? contentFindings.length);
+  const confirmedBugs = isLegacySummary
+    ? contentFindings.filter(f => f.confidence === 'confirmed' && f.findingType === 'bug').length
+    : (s.confirmedBugs ?? contentFindings.filter(f => f.confidence === 'confirmed' && f.findingType === 'bug').length);
+  const totalOccurrences = isLegacySummary
+    ? contentFindings.reduce((sum, f) => sum + (f.occurrences || 1), 0)
+    : (s.totalOccurrences ?? contentFindings.reduce((sum, f) => sum + (f.occurrences || 1), 0));
   const duration = run.completedAt
     ? Math.max(1, Math.round((new Date(run.completedAt) - new Date(run.startedAt)) / 1000))
     : null;
@@ -385,8 +460,11 @@ export function generateHtmlReport(run) {
         <span class="verdict-pill" style="background: ${v.tone};">${escapeHtml(v.label)}</span>
       </div>
       <div class="cover-right">
-        ${scoreRingSvg(run.score)}
+        ${scoreRingSvg(displayScore)}
         <div class="caption">Quality score</div>
+        <div class="coverage-caption" style="margin-top: 8px; font-size: 13px; font-weight: 600; color: #334155; text-align: center;">
+          ${pagesScanned}/${pagesAttempted} pages scanned (${Math.round(coverageRatio * 100)}% coverage)
+        </div>
       </div>
     </div>
 
@@ -397,6 +475,9 @@ export function generateHtmlReport(run) {
       <div class="stat"><div class="v">${totalOccurrences}</div><div class="l">Occurrences</div></div>
       <div class="stat"><div class="v">${run.options?.monitorId ? 'Scheduled' : 'Manual'}</div><div class="l">Run type</div></div>
     </div>
+
+    ${coverageSectionHtml}
+    ${unauthSectionHtml}
 
     ${wcagSectionHtml(run)}
     ${fixChecklistHtml(run)}
@@ -456,6 +537,22 @@ export function generateJsonReport(run) {
     })),
   }));
 
+  const allFindings = run.findings || [];
+  const coverageFailuresList = run.coverageFailures && run.coverageFailures.length > 0
+    ? run.coverageFailures
+    : allFindings.filter(isCoverageFailure);
+  const unauthProbesList = allFindings.filter(isUnauthenticatedProbe);
+  const contentFindings = allFindings.filter(f => !isCoverageFailure(f) && !isUnauthenticatedProbe(f));
+
+  const failedUrls = new Set(coverageFailuresList.map(f => f.pageUrl).filter(Boolean));
+  const pagesAttempted = run.coverage?.pagesAttempted ?? (run.pages ? run.pages.length : (run.options?.maxPages || 1));
+  const pagesScanned = run.coverage?.pagesScanned ?? Math.max(0, pagesAttempted - failedUrls.size);
+  const coverageRatio = run.coverage?.coverageRatio ?? (pagesAttempted > 0 ? pagesScanned / pagesAttempted : 1.0);
+
+  const displayScore = (run.coverage == null && coverageRatio < 1.0 && run.score != null)
+    ? calculateScore(allFindings, { pagesAttempted, pagesScanned, coverageRatio })
+    : run.score;
+
   const findings = (run.findings || []).map(f => ({
     id: f.id,
     title: f.title,
@@ -474,6 +571,8 @@ export function generateJsonReport(run) {
     affectedElements: f.affectedElements,
     reproSteps: f.reproSteps,
     screenshot: f.screenshot,
+    ...(f.selector ? { selector: f.selector } : {}),
+    ...(f.metrics ? { metrics: f.metrics } : {}),
   }));
 
   const report = {
@@ -484,11 +583,18 @@ export function generateJsonReport(run) {
     startedAt: run.startedAt,
     completedAt: run.completedAt,
     options: run.options,
-    score: run.score,
+    score: displayScore,
     compliance: computeCompliance(run),
+    coverage: {
+      pagesAttempted,
+      pagesScanned,
+      coverageRatio,
+    },
+    coverageFailures: coverageFailuresList,
+    unauthenticatedProbes: unauthProbesList,
     summary: {
       totalPages: s.totalPages ?? (run.pages ? run.pages.length : 0),
-      totalFindings: s.totalFindings ?? findings.length,
+      totalFindings: (s.coverageFailures == null && (coverageFailuresList.length > 0 || unauthProbesList.length > 0)) ? contentFindings.length : (s.totalFindings ?? contentFindings.length),
       totalOccurrences: s.totalOccurrences ?? findings.length,
       bySeverity: s.bySeverity || { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
       byCategory: s.byCategory || {},
@@ -496,6 +602,9 @@ export function generateJsonReport(run) {
       byFindingType: s.byFindingType || { bug: 0, warning: 0, recommendation: 0, informational: 0, environmental: 0 },
       byOrigin: s.byOrigin || { 'first-party': 0, 'third-party': 0, unknown: 0 },
       confirmedBugs: s.confirmedBugs ?? 0,
+      coverageFailures: coverageFailuresList.length,
+      unauthenticatedProbes: unauthProbesList.length,
+      totalFindingsShown: (s.confirmedBugs ?? 0) + unauthProbesList.length + coverageFailuresList.length,
       observationCount: s.observationCount ?? 0,
       recommendationCount: s.recommendationCount ?? 0,
     },

@@ -7,14 +7,20 @@
   "engines": {
     "node": ">=18"
   },
+  "bin": {
+    "testflow-mcp": "src/mcp/stdio.js"
+  },
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
+    "fixture:serve": "node test/fixtures/site/server.js",
     "start": "node dashboard/server.js",
     "start:dashboard": "node dashboard/server.js",
-    "migrate:sqlite": "node scripts/migrate-json-to-sqlite.js"
+    "migrate:sqlite": "node scripts/migrate-json-to-sqlite.js",
+    "mcp": "node src/mcp/stdio.js"
   },
   "dependencies": {
     "@axe-core/playwright": "^4.10.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "better-sqlite3": "^13.0.3",
     "cors": "^2.8.5",
     "express": "^4.21.0",

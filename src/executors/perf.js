@@ -12,6 +12,8 @@
  * Playwright context's CDP session.
  */
 
+import { config } from '../utils/config.js';
+
 // Metric → threshold unit (for human-readable finding)
 const METRIC_UNITS = {
   LCP: 'ms',
@@ -30,90 +32,238 @@ const METRIC_UNITS = {
  * @param {string} url
  * @param {object} [opts]
  * @param {number} [opts.settleMs=2500] — time to wait after load for LCP to settle
- * @returns {Promise<{ metrics: { LCP, CLS, TBT, FCP, TTFB, pageSizeBytes, requestCount } }>}
+ * @returns {Promise<{ metrics: { LCP, CLS, TBT, FCP, TTFB, pageSizeBytes, requestCount, measured } }>}
  */
 export async function capturePerfMetrics(page, url, opts = {}) {
   const settleMs = opts.settleMs ?? 2500;
+  const timeoutMs = opts.timeout ?? (config?.pageTimeoutMs || 30000);
 
-  // Create a CDP session
-  const client = await page.context().newCDPSession(page);
+  // Create a CDP session if supported
+  let client = null;
+  try {
+    client = await page.context().newCDPSession(page);
+    await client.send('Performance.enable').catch(() => {});
+    await client.send('Network.enable').catch(() => {});
+    await client.send('Network.clearBrowserCache').catch(() => {});
+  } catch {
+    // CDP not available (e.g. mock context in tests)
+  }
 
-  // Enable Performance domain for metrics
-  await client.send('Performance.enable');
-  // Enable Network domain for resource counting
-  await client.send('Network.enable');
-
-  // Track LCP/CLS via PerformanceObserver in the page
-  const perfObserverResults = await page.evaluate(async (settleMs) => {
-    return new Promise((resolve) => {
-      const result = { LCP: 0, CLS: 0, FCP: 0, TTFB: 0, TBT: 0 };
-      const entries = [];
-
-      const po = new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) {
-          entries.push({ name: entry.name, value: entry.value, startTime: entry.startTime });
-        }
-      });
-      po.observe({ type: 'largest-contentful-paint', buffered: true });
-      po.observe({ type: 'layout-shift', buffered: true });
-      po.observe({ type: 'paint', buffered: true });
-      po.observe({ type: 'longtask', buffered: true });
-
-      // Resolve after settle period
-      setTimeout(() => {
-        for (const e of entries) {
-          if (e.name === 'largest-contentful-paint') result.LCP = Math.max(result.LCP, e.value);
-          if (e.name === 'layout-shift' && !e.hadRecentInput) result.CLS += e.value;
-          if (e.name === 'first-contentful-paint') result.FCP = Math.max(result.FCP, e.value);
-          if (e.name === 'longtask') result.TBT += e.value;
-        }
-        result.TTFB = performance.timing?.responseStart - performance.timing?.requestStart || 0;
-        resolve(result);
-      }, settleMs);
+  // Pre-inject PerformanceObserver on the new document to buffer entries from the very start of navigation
+  try {
+    await page.addInitScript(() => {
+      window.__perfEntries = [];
+      try {
+        const po = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            window.__perfEntries.push({
+              entryType: entry.entryType,
+              name: entry.name,
+              value: entry.value,
+              startTime: entry.startTime,
+              duration: entry.duration,
+              hadRecentInput: entry.hadRecentInput,
+            });
+          }
+        });
+        po.observe({ type: 'largest-contentful-paint', buffered: true });
+        po.observe({ type: 'layout-shift', buffered: true });
+        po.observe({ type: 'paint', buffered: true });
+        po.observe({ type: 'longtask', buffered: true });
+      } catch {}
     });
-  }, settleMs);
+  } catch {}
 
-  // Reset + navigate
-  await client.send('Network.clearBrowserCache');
-  await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+  // Navigate to target URL
+  await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
 
   // Wait for settle
   await page.waitForTimeout(settleMs);
 
-  // Get resource count + total size via Network domain
+  // Evaluate performance metrics on the loaded page
+  const evalResults = await page.evaluate(() => {
+    const result = {
+      LCP: null,
+      CLS: 0,
+      FCP: null,
+      TTFB: null,
+      TBT: 0,
+      measured: {
+        LCP: false,
+        CLS: false,
+        FCP: false,
+        TTFB: false,
+        TBT: false,
+      },
+    };
+
+    // 1. Navigation / TTFB
+    try {
+      const navList = performance.getEntriesByType('navigation');
+      if (navList.length > 0) {
+        const nav = navList[0];
+        if (nav.responseStart > 0 && nav.requestStart >= 0) {
+          const ttfb = nav.responseStart - nav.requestStart;
+          if (ttfb > 0) {
+            result.TTFB = ttfb;
+            result.measured.TTFB = true;
+          }
+        }
+      }
+    } catch {}
+
+    if (result.TTFB == null && performance.timing) {
+      const pt = performance.timing;
+      if (pt.responseStart > 0 && pt.requestStart > 0) {
+        const ttfb = pt.responseStart - pt.requestStart;
+        if (ttfb > 0) {
+          result.TTFB = ttfb;
+          result.measured.TTFB = true;
+        }
+      }
+    }
+
+    // 2. Paint / FCP
+    try {
+      const paintList = performance.getEntriesByType('paint');
+      for (const p of paintList) {
+        if (p.name === 'first-contentful-paint' && p.startTime > 0) {
+          result.FCP = p.startTime;
+          result.measured.FCP = true;
+        }
+      }
+    } catch {}
+
+    // 3. LCP from getEntriesByType
+    try {
+      const lcpList = performance.getEntriesByType('largest-contentful-paint');
+      if (lcpList.length > 0) {
+        const lastLcp = lcpList[lcpList.length - 1];
+        if (lastLcp.startTime > 0) {
+          result.LCP = lastLcp.startTime;
+          result.measured.LCP = true;
+        }
+      }
+    } catch {}
+
+    // 4. CLS & TBT from observer / buffered entries
+    const buffered = window.__perfEntries || [];
+    let clsSum = 0;
+    let tbtSum = 0;
+    let clsObserved = false;
+    let tbtObserved = false;
+
+    try {
+      const clsEntries = performance.getEntriesByType('layout-shift');
+      for (const c of clsEntries) {
+        clsObserved = true;
+        if (!c.hadRecentInput) {
+          clsSum += (c.value || 0);
+        }
+      }
+    } catch {}
+
+    try {
+      const longtasks = performance.getEntriesByType('longtask');
+      for (const lt of longtasks) {
+        tbtObserved = true;
+        tbtSum += Math.max(0, (lt.duration || 0) - 50);
+      }
+    } catch {}
+
+    for (const e of buffered) {
+      if ((e.entryType === 'largest-contentful-paint' || e.name === 'largest-contentful-paint') && (e.startTime || e.value) > 0) {
+        result.LCP = Math.max(result.LCP || 0, e.startTime ?? e.value);
+        result.measured.LCP = true;
+      }
+      if ((e.entryType === 'paint' && e.name === 'first-contentful-paint') && (e.startTime || e.value) > 0) {
+        result.FCP = Math.max(result.FCP || 0, e.startTime ?? e.value);
+        result.measured.FCP = true;
+      }
+      if (e.entryType === 'layout-shift' || e.name === 'layout-shift') {
+        clsObserved = true;
+        if (!e.hadRecentInput && e.value != null) {
+          clsSum += e.value;
+        }
+      }
+      if (e.entryType === 'longtask' || e.name === 'longtask') {
+        tbtObserved = true;
+        const dur = e.duration ?? e.value ?? 0;
+        tbtSum += Math.max(0, dur - 50);
+      }
+    }
+
+    result.CLS = Number(clsSum.toFixed(3));
+    result.measured.CLS = clsObserved;
+    result.TBT = Math.round(tbtSum);
+    result.measured.TBT = tbtObserved;
+
+    return result;
+  });
+
+  // Resource count and size
   const resourceStats = await page.evaluate(() => {
-    const entries = performance.getEntriesByType('resource');
     let totalSize = 0;
+    const navEntries = performance.getEntriesByType('navigation');
+    if (navEntries.length > 0) {
+      totalSize += (navEntries[0].transferSize || navEntries[0].encodedBodySize || 0);
+    }
+    const entries = performance.getEntriesByType('resource');
     for (const e of entries) {
-      totalSize += e.transferSize || 0;
+      totalSize += (e.transferSize || e.encodedBodySize || 0);
     }
     return { requestCount: entries.length, pageSizeBytes: totalSize };
   });
 
-  await client.detach();
+  if (client) {
+    await client.detach().catch(() => {});
+  }
+
+  // Ensure "always measured" metrics (LCP, FCP, TTFB) are never bare 0:
+  // If measured and > 0, return the number. If not measured, mark "unmeasured"
+  const LCP = evalResults.measured.LCP && evalResults.LCP > 0
+    ? Math.round(evalResults.LCP)
+    : 'unmeasured';
+  const FCP = evalResults.measured.FCP && evalResults.FCP > 0
+    ? Math.round(evalResults.FCP)
+    : 'unmeasured';
+  const TTFB = evalResults.measured.TTFB && evalResults.TTFB > 0
+    ? Math.round(evalResults.TTFB)
+    : 'unmeasured';
+  const CLS = evalResults.CLS;
+  const TBT = evalResults.TBT;
 
   return {
     metrics: {
-      LCP: Math.round(perfObserverResults.LCP || 0),
-      CLS: Number(perfObserverResults.CLS?.toFixed(3) || 0),
-      TBT: Math.round(perfObserverResults.TBT || 0),
-      FCP: Math.round(perfObserverResults.FCP || 0),
-      TTFB: Math.round(perfObserverResults.TTFB || 0),
+      LCP,
+      CLS,
+      TBT,
+      FCP,
+      TTFB,
       pageSizeBytes: resourceStats.pageSizeBytes,
       requestCount: resourceStats.requestCount,
+      measured: {
+        LCP: evalResults.measured.LCP && evalResults.LCP > 0,
+        CLS: evalResults.measured.CLS,
+        TBT: evalResults.measured.TBT,
+        FCP: evalResults.measured.FCP && evalResults.FCP > 0,
+        TTFB: evalResults.measured.TTFB && evalResults.TTFB > 0,
+      },
     },
   };
 }
 
 /**
  * Compare captured metrics against the plan's budgets.
- * Returns an array of { budget, actual, exceeded_by } for each exceeded budget.
+ * Returns an array of { budget, actual, exceededBy } for each exceeded budget.
  */
 export function checkBudgets(metrics, budgets) {
   const exceeded = [];
   for (const budget of budgets) {
-    const actual = metrics[budget.metric];
-    if (actual == null) continue;
+    const rawActual = metrics[budget.metric];
+    if (rawActual == null || rawActual === 'unmeasured') continue;
+    const actual = typeof rawActual === 'object' && rawActual !== null ? rawActual.value : rawActual;
+    if (typeof actual !== 'number' || isNaN(actual)) continue;
     if (actual > budget.threshold) {
       exceeded.push({
         budget,
@@ -141,6 +291,11 @@ export default async function perfExecutor(ctx) {
   for (const pageInfo of pages) {
     if (ctx.signal?.aborted) break;
 
+    if (ctx.isPageFailed?.(pageInfo.url)) {
+      ctx.recordPageFailure?.({ url: pageInfo.url, executor: 'perf' });
+      continue;
+    }
+
     const page = await ctx.context.newPage();
     try {
       const { metrics } = await capturePerfMetrics(page, pageInfo.url);
@@ -160,20 +315,27 @@ export default async function perfExecutor(ctx) {
           description: `Metric ${ex.budget.metric} exceeded its budget by ${Math.round(ex.exceededBy)}${unit}.`,
           evidence: `Budget: ${ex.budget.threshold}${unit}\nActual: ${ex.actual}${unit}\nAll metrics: ${JSON.stringify(metrics)}`,
           suggestedFix: getPerfFix(ex.budget.metric),
+          metrics,
         }));
       }
     } catch (err) {
-      findings.push(ctx.createFinding({
-        title: `Perf measurement failed on ${pageInfo.url}`,
-        severity: 'low',
-        confidence: 'high',
-        category: 'performance',
-        findingType: 'environmental',
-        origin: 'first-party',
-        ruleId: 'perf-measurement-error',
-        pageUrl: pageInfo.url,
-        description: err.message,
-      }));
+      if (ctx.recordPageFailure) {
+        ctx.recordPageFailure({ url: pageInfo.url, error: err.message, executor: 'perf' });
+      } else {
+        findings.push(ctx.createFinding({
+          title: `Page load failed: ${pageInfo.url}`,
+          severity: 'info',
+          confidence: 'high',
+          category: 'Scan Coverage',
+          findingType: 'coverage-failure',
+          origin: 'first-party',
+          ruleId: 'page-load-failure',
+          pageUrl: pageInfo.url,
+          description: err.message,
+          evidence: err.message,
+          blockedExecutors: ['perf'],
+        }));
+      }
     } finally {
       await page.close().catch(() => {});
     }
